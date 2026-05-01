@@ -39,5 +39,5 @@ Mục tiêu của dự án là thiết kế một hệ đo có khả năng:
 - **Encoder**: TRIG → PB6 (output), ECHO → PB7 (Input capture - TIM4_CH2) (HC_SR04 module)
 
 ### Giao tiếp với GUI
-- **UART qua COM port**
+- **UART qua COM port**: PA11 - USB_DM, PA12 - USB - DP
 ---
