@@ -6,10 +6,10 @@
 
 Hệ thống thu thập dữ liệu từ 4 cảm biến:
 
-- **Thermistor**: đo nhiệt độ
-- **Loadcell**: đo lực/khối lượng
-- **Potentiometer**: đo góc hoặc vị trí
-- **Incremental Encoder**: đo vị trí/góc quay
+- **Thermistor**:
+- **Laser**: 
+- **Potentiometer**:
+- **Ultra sonic**:
 
 Dữ liệu được xử lý trên MCU, sau đó truyền theo thời gian thực lên GUI qua **UART (COM Port)**.  
 Mục tiêu của dự án là thiết kế một hệ đo có khả năng:
@@ -22,51 +22,22 @@ Mục tiêu của dự án là thiết kế một hệ đo có khả năng:
 
 ---
 
-## 2. Hướng triển khai đã chọn
+## 2. Hướng triển khai
 
 ### MCU firmware
 - Vi điều khiển: **STM32F103C8T6**
 - IDE/Compiler: **Keil MDK**
 - Cấu hình ngoại vi: **STM32CubeMX + HAL**
-- Kiến trúc phần mềm: **super loop + scheduler mềm**
+- Kiến trúc phần mềm: **loop + scheduler**
 - Dùng **interrupt + DMA** ở các vị trí cần thiết
 - **Không dùng FreeRTOS**
 
 ### Phần đọc cảm biến
-- **Thermistor**: ADC + DMA
-- **Potentiometer**: ADC + DMA
-- **Loadcell**: HX711
-- **Encoder**: Timer Encoder Mode
+- **Thermistor**: ADC1_IN0 - PA0
+- **Potentiometer**: ADC2_IN1 - PA1
+- **Laser**: PB8 → I2C1_SCL, PB8 → I2C1_SCL (module VL53L0X)
+- **Encoder**: TRIG → PB6 (output), ECHO → PB7 (Input capture - TIM4_CH2) (HC_SR04 module)
 
 ### Giao tiếp với GUI
 - **UART qua COM port**
-- Giai đoạn đầu dùng **ASCII packet** để đơn giản hóa việc debug và kiểm thử
-
 ---
-
-## 3. Kiến trúc hệ thống
-
-```text
-[Cảm biến]
-   |-- Thermistor ------> ADC + DMA
-   |-- Potentiometer ---> ADC + DMA
-   |-- Loadcell --------> HX711
-   |-- Encoder ---------> Timer Encoder Mode
-                |
-                v
-        [STM32F103C8T6]
-        - lọc dữ liệu
-        - chuyển đổi đơn vị
-        - hiệu chuẩn
-        - phát hiện lỗi cơ bản
-        - đóng gói khung truyền UART
-                |
-                v
-        [UART / COM Port]
-                |
-                v
-         [GUI C# WinForms]
-         - hiển thị realtime
-         - vẽ biểu đồ
-         - hiệu chuẩn
-         - gửi lệnh điều khiển
