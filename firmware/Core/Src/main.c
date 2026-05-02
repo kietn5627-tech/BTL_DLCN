@@ -22,7 +22,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "usbd_cdc_if.h"
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -70,7 +72,45 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-uint8_t dem=0;
+static uint32_t last_send_time = 0;
+
+// Giả lập data
+static int thermistor_x10 = 253;    // 25.3
+static int laser_x10 = 105;         // 10.5
+static int potentiometer = 45;      // 45 %
+static int ultrasonic = 120;        // 120 cm
+
+void Update_Fake_Sensor_Data(void)
+{
+    thermistor_x10 += 1;     // tăng 0.1
+    laser_x10 += 2;          // tăng 0.2
+    potentiometer += 1;
+    ultrasonic += 1;
+
+    if (thermistor_x10 > 350) thermistor_x10 = 253;
+    if (laser_x10 > 300) laser_x10 = 105;
+    if (potentiometer > 100) potentiometer = 0;
+    if (ultrasonic > 200) ultrasonic = 120;
+}
+
+void Send_Sensor_Data_USB(void)
+{
+    char tx_buffer[128];
+
+    int len = snprintf(tx_buffer, sizeof(tx_buffer),
+                       "THERMISTOR:%d.%d;LASER:%d.%d;POTENTIOMETER:%d;ULTRASONIC:%d\r\n",
+                       thermistor_x10 / 10,
+                       thermistor_x10 % 10,
+                       laser_x10 / 10,
+                       laser_x10 % 10,
+                       potentiometer,
+                       ultrasonic);
+
+    if (len > 0)
+    {
+        CDC_Transmit_FS((uint8_t*)tx_buffer, len);
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -117,6 +157,13 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	 if (HAL_GetTick() - last_send_time >= 500)
+	 {
+		 last_send_time = HAL_GetTick();
+
+		 Update_Fake_Sensor_Data();
+		 Send_Sensor_Data_USB();
+	 }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -481,6 +528,7 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
+	/*
 	if (htim->Instance == TIM1)
 	  {
           dem++;
@@ -492,7 +540,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 	    	 dem=0;
 	      	 HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_1);
 	      }
-	  }
+	  */
 }
 /* USER CODE END 4 */
 
