@@ -25,6 +25,7 @@
 #include "usbd_cdc_if.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,6 +55,45 @@ TIM_HandleTypeDef htim4;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+static volatile uint8_t flag_10ms = 0;
+static volatile uint8_t flag_50ms = 0;
+static volatile uint8_t flag_100ms = 0;
+static volatile uint16_t timer_counter = 0;
+/* =========================
+   SENSOR DATA STRUCT
+   ========================= */
+typedef struct
+{
+    float thermistor_degC;
+    float potentiometer_deg;
+    float ultrasonic_cm;
+    float laser_mm;
+} SensorData_t;
+
+static SensorData_t sensor_data;
+
+/* =========================
+   ULTRASONIC INPUT CAPTURE
+   ========================= */
+static volatile uint32_t ultrasonic_rise_tick = 0;
+static volatile uint32_t ultrasonic_fall_tick = 0;
+static volatile uint32_t ultrasonic_echo_us = 0;
+static volatile uint8_t ultrasonic_capture_state = 0;
+static volatile uint8_t ultrasonic_data_ready = 0;
+
+/* =========================
+   SAMPLE ACCUMULATOR
+   Lay mau roi cong don de tinh trung binh
+   ========================= */
+static float thermistor_sum = 0.0f;
+static float potentiometer_sum = 0.0f;
+static float laser_sum = 0.0f;
+static float ultrasonic_sum = 0.0f;
+
+static uint8_t thermistor_sample_count = 0;
+static uint8_t potentiometer_sample_count = 0;
+static uint8_t laser_sample_count = 0;
+static uint8_t ultrasonic_sample_count = 0;
 
 /* USER CODE END PV */
 
@@ -111,6 +151,368 @@ void Send_Sensor_Data_USB(void)
         CDC_Transmit_FS((uint8_t*)tx_buffer, len);
     }
 }
+
+/* =========================
+   HAM GIOI HAN GIA TRI
+   ========================= */
+static float Clamp_Float(float value, float min, float max)
+{
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+}
+
+/* =========================
+   DOC ADC DUNG CHUNG
+   ========================= */
+uint16_t Read_ADC_Value(ADC_HandleTypeDef *hadc)
+{
+    uint16_t adc_value = 0;
+
+    HAL_ADC_Start(hadc);
+
+    if (HAL_ADC_PollForConversion(hadc, 10) == HAL_OK)
+    {
+        adc_value = HAL_ADC_GetValue(hadc);
+    }
+
+    HAL_ADC_Stop(hadc);
+
+    return adc_value;
+}
+
+/* =========================
+   1. DOC THERMISTOR
+   ADC1 PA0 -> Nhiet do
+   ========================= */
+float Read_Thermistor_degC(void)
+{
+    uint16_t adc_raw = Read_ADC_Value(&hadc1);
+
+    const float Vref = 3.3f;
+    const float R_fixed = 10000.0f;   // dien tro co dinh 10k
+    const float R0 = 10000.0f;        // NTC 10k tai 25 do C
+    const float T0 = 298.15f;         // 25 do C = 298.15 K
+    const float BETA = 3950.0f;       // he so beta, sau nay sua theo datasheet
+
+    float Vout = adc_raw * Vref / 4095.0f;
+
+    if (Vout <= 0.01f || Vout >= (Vref - 0.01f))
+    {
+        return -999.0f;
+    }
+
+    /*
+       Mach gia dinh:
+       3.3V --- R_fixed --- ADC --- NTC --- GND
+
+       R_ntc = R_fixed * Vout / (Vref - Vout)
+    */
+    float R_ntc = R_fixed * Vout / (Vref - Vout);
+
+    /*
+       Cong thuc Beta:
+       T(K) = 1 / [1/T0 + (1/BETA)*ln(R/R0)]
+       T(C) = T(K) - 273.15
+    */
+    float T_kelvin = 1.0f / ((1.0f / T0) + (1.0f / BETA) * logf(R_ntc / R0));
+    float T_celsius = T_kelvin - 273.15f;
+
+    return T_celsius;
+}
+
+/* =========================
+   2. DOC POTENTIOMETER
+   ADC2 PA1 -> Goc 0-300 do
+   ========================= */
+float Read_Potentiometer_deg(void)
+{
+    uint16_t adc_raw = Read_ADC_Value(&hadc2);
+
+    const float Vref = 3.3f;
+
+    /*
+       Neu mach scale cua ban la 0.1V den 3.1V
+       tuong ung goc 0 den 300 do
+    */
+    const float Vmin = 0.1f;
+    const float Vmax = 3.1f;
+
+    float Vout = adc_raw * Vref / 4095.0f;
+
+    Vout = Clamp_Float(Vout, Vmin, Vmax);
+
+    float angle_deg = (Vout - Vmin) * 300.0f / (Vmax - Vmin);
+
+    return angle_deg;
+}
+
+/* =========================
+   DELAY US DUNG TIM4
+   Luu y: TIM4 nen cau hinh Prescaler = 72 - 1 de 1 tick = 1us
+   ========================= */
+void Delay_us_TIM4(uint16_t us)
+{
+    __HAL_TIM_SET_COUNTER(&htim4, 0);
+
+    while (__HAL_TIM_GET_COUNTER(&htim4) < us)
+    {
+        // wait
+    }
+}
+
+/* =========================
+   PHAT XUNG TRIG CHO HC-SR04
+   TRIG = PB6
+   ECHO = PB7 / TIM4_CH2
+   ========================= */
+void Ultrasonic_Trigger(void)
+{
+    ultrasonic_data_ready = 0;
+    ultrasonic_capture_state = 0;
+    ultrasonic_echo_us = 0;
+
+    __HAL_TIM_SET_COUNTER(&htim4, 0);
+
+    __HAL_TIM_SET_CAPTUREPOLARITY(&htim4, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_RISING);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+    Delay_us_TIM4(2);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+    Delay_us_TIM4(10);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+}
+
+/* =========================
+   3. DOC ULTRASONIC
+   Echo time -> distance cm
+   ========================= */
+float Read_Ultrasonic_cm(float tempC)
+{
+    Ultrasonic_Trigger();
+
+    /*
+       Cho echo toi da khoang 30ms.
+       Neu qua 30ms ma khong co data thi bao loi.
+    */
+    uint32_t start_tick = HAL_GetTick();
+
+    while (!ultrasonic_data_ready)
+    {
+        if (HAL_GetTick() - start_tick > 30)
+        {
+            return -1.0f;
+        }
+    }
+
+    /*
+       v = 331.4 + 0.6*T  m/s
+       doi sang cm/us: chia 10000
+    */
+    float speed_cm_us = (331.4f + 0.6f * tempC) / 10000.0f;
+
+    /*
+       Song di va ve nen chia 2
+    */
+    float distance_cm = ultrasonic_echo_us * speed_cm_us / 2.0f;
+
+    /*
+       Calib tuyen tinh:
+       distance_calib = a * distance_read + b
+       Sau nay thay a,b bang gia tri calib that.
+    */
+    const float a = 1.0f;
+    const float b = 0.0f;
+
+    float distance_calib = a * distance_cm + b;
+
+    return distance_calib;
+}
+
+/* =========================
+   4. DOC LASER VL53L0X
+   Luu y: VL53L0X can driver rieng.
+   Ham nay hien tai moi kiem tra co cam bien I2C hay chua.
+   ========================= */
+float Read_Laser_VL53L0X_mm(void)
+{
+    /*
+       Dia chi mac dinh cua VL53L0X thuong la 0x29.
+       HAL can dia chi dich trai 1 bit.
+    */
+    uint16_t VL53L0X_ADDR = 0x29 << 1;
+
+    if (HAL_I2C_IsDeviceReady(&hi2c1, VL53L0X_ADDR, 2, 10) != HAL_OK)
+    {
+        return -1.0f;   // khong tim thay cam bien
+    }
+
+    /*
+       VL53L0X khong the doc khoang cach chi bang 1 lenh I2C don gian.
+       Can them driver khoi tao va ham ranging.
+
+       Sau khi co driver, thay phan nay bang:
+       D_read_mm = VL53L0X_ReadRange();
+    */
+
+    float D_read_mm = 0.0f;
+
+    /*
+       Calib tuyen tinh:
+       D_calib = a * D_read + b
+    */
+    const float a = 1.0f;
+    const float b = 0.0f;
+
+    float D_calib_mm = a * D_read_mm + b;
+
+    return D_calib_mm;
+}
+
+/* =========================
+   GUI DU LIEU 4 CAM BIEN DA XU LY
+   USB CDC
+   ========================= */
+void Send_Real_Sensor_Data_USB(void)
+{
+    char tx_buffer[160];
+
+    int len = snprintf(tx_buffer, sizeof(tx_buffer),
+                       "THERMISTOR:%.1f;POTENTIOMETER:%.1f;ULTRASONIC:%.1f;LASER:%.1f\r\n",
+                       sensor_data.thermistor_degC,
+                       sensor_data.potentiometer_deg,
+                       sensor_data.ultrasonic_cm,
+                       sensor_data.laser_mm);
+
+    if (len > 0)
+    {
+        CDC_Transmit_FS((uint8_t*)tx_buffer, len);
+    }
+}
+
+/* =========================
+   RESET BO DEM MAU
+   Goi sau khi da tinh trung binh va gui USB
+   ========================= */
+void Reset_Sensor_Sample_Buffer(void)
+{
+    thermistor_sum = 0.0f;
+    potentiometer_sum = 0.0f;
+    laser_sum = 0.0f;
+    ultrasonic_sum = 0.0f;
+
+    thermistor_sample_count = 0;
+    potentiometer_sample_count = 0;
+    laser_sample_count = 0;
+    ultrasonic_sample_count = 0;
+}
+
+/* =========================
+   TASK 10ms
+   Moi 10ms lay 1 mau:
+   - Thermistor
+   - Potentiometer
+   - Laser
+   ========================= */
+void Sensor_Task_10ms(void)
+{
+    float thermistor_value = Read_Thermistor_degC();
+
+    if (thermistor_value > -100.0f)
+    {
+        thermistor_sum += thermistor_value;
+        thermistor_sample_count++;
+    }
+
+    float potentiometer_value = Read_Potentiometer_deg();
+
+    potentiometer_sum += potentiometer_value;
+    potentiometer_sample_count++;
+
+    float laser_value = Read_Laser_VL53L0X_mm();
+
+    if (laser_value >= 0.0f)
+    {
+        laser_sum += laser_value;
+        laser_sample_count++;
+    }
+}
+
+/* =========================
+   TASK 50ms
+   Moi 50ms lay 1 mau ultrasonic
+   ========================= */
+void Sensor_Task_50ms(void)
+{
+    /*
+       Dung nhiet do gan nhat de bu van toc am thanh.
+       Neu chua co mau thermistor hop le thi tam dung 25 do C.
+    */
+    float tempC = 25.0f;
+
+    if (thermistor_sample_count > 0)
+    {
+        tempC = thermistor_sum / thermistor_sample_count;
+    }
+
+    float ultrasonic_value = Read_Ultrasonic_cm(tempC);
+
+    if (ultrasonic_value > 0.0f)
+    {
+        ultrasonic_sum += ultrasonic_value;
+        ultrasonic_sample_count++;
+    }
+}
+
+/* =========================
+   TINH TRUNG BINH CAC MAU
+   Goi truoc khi gui USB
+   ========================= */
+void Sensor_Compute_Average(void)
+{
+    if (thermistor_sample_count > 0)
+    {
+        sensor_data.thermistor_degC =
+            thermistor_sum / thermistor_sample_count;
+    }
+    else
+    {
+        sensor_data.thermistor_degC = -999.0f;
+    }
+
+    if (potentiometer_sample_count > 0)
+    {
+        sensor_data.potentiometer_deg =
+            potentiometer_sum / potentiometer_sample_count;
+    }
+    else
+    {
+        sensor_data.potentiometer_deg = -1.0f;
+    }
+
+    if (laser_sample_count > 0)
+    {
+        sensor_data.laser_mm =
+            laser_sum / laser_sample_count;
+    }
+    else
+    {
+        sensor_data.laser_mm = -1.0f;
+    }
+
+    if (ultrasonic_sample_count > 0)
+    {
+        sensor_data.ultrasonic_cm =
+            ultrasonic_sum / ultrasonic_sample_count;
+    }
+    else
+    {
+        sensor_data.ultrasonic_cm = -1.0f;
+    }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -150,20 +552,50 @@ int main(void)
   MX_USB_DEVICE_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_Base_Start_IT(&htim4);
+  HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_2);
+  HAL_TIM_Base_Start_IT(&htim2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	 if (HAL_GetTick() - last_send_time >= 500)
-	 {
-		 last_send_time = HAL_GetTick();
+	  /*
+	        flag_10ms:
+	        Moi 10ms lay 1 mau thermistor, potentiometer, laser.
+	     */
+	     if (flag_10ms)
+	     {
+	         flag_10ms = 0;
 
-		 Update_Fake_Sensor_Data();
-		 Send_Sensor_Data_USB();
-	 }
+	         Sensor_Task_10ms();
+	     }
+
+	     /*
+	        flag_50ms:
+	        Moi 50ms lay 1 mau ultrasonic.
+	     */
+	     if (flag_50ms)
+	     {
+	         flag_50ms = 0;
+
+	         Sensor_Task_50ms();
+	     }
+
+	     /*
+	        flag_100ms:
+	        Moi 100ms tinh trung binh va gui USB.
+	     */
+	     if (flag_100ms)
+	     {
+	         flag_100ms = 0;
+
+	         Sensor_Compute_Average();
+	         Send_Real_Sensor_Data_USB();
+
+	         Reset_Sensor_Sample_Buffer();
+	     }
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -528,19 +960,84 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-	/*
-	if (htim->Instance == TIM1)
-	  {
-          dem++;
-	      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-	      if(dem%5==0){
-	    	 HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_0);
-	      }
-	      if(dem==10){
-	    	 dem=0;
-	      	 HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_1);
-	      }
-	  */
+    if (htim->Instance == TIM2)
+    {
+        /*
+           TIM2 ngắt mỗi 10ms.
+           Mỗi lần ngắt tăng counter.
+        */
+        timer_counter++;
+        /*
+           Task 10ms:
+           Mỗi lần ngắt đều bật flag_10ms.
+        */
+        flag_10ms = 1;
+        /*
+           Task 50ms:
+           5 lần ngắt x 10ms = 50ms.
+        */
+        if (timer_counter % 5 == 0)
+        {
+            flag_50ms = 1;
+        }
+
+        /*
+           Task 100ms:
+           10 lần ngắt x 10ms = 100ms.
+        */
+        if (timer_counter % 10 == 0)
+        {
+            flag_100ms = 1;
+        }
+
+        /*
+           Reset counter để tránh tăng mãi.
+           100 lần ngắt x 10ms = 1000ms = 1s.
+        */
+        if (timer_counter >= 100)
+        {
+            timer_counter = 0;
+        }
+    }
+}
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM4 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
+    {
+        if (ultrasonic_capture_state == 0)
+        {
+            /*
+               Bat canh len cua Echo
+            */
+            ultrasonic_rise_tick = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+
+            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_FALLING);
+
+            ultrasonic_capture_state = 1;
+        }
+        else
+        {
+            /*
+               Bat canh xuong cua Echo
+            */
+            ultrasonic_fall_tick = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+
+            if (ultrasonic_fall_tick >= ultrasonic_rise_tick)
+            {
+                ultrasonic_echo_us = ultrasonic_fall_tick - ultrasonic_rise_tick;
+            }
+            else
+            {
+                ultrasonic_echo_us = (65535 - ultrasonic_rise_tick) + ultrasonic_fall_tick + 1;
+            }
+
+            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_RISING);
+
+            ultrasonic_capture_state = 0;
+            ultrasonic_data_ready = 1;
+        }
+    }
 }
 /* USER CODE END 4 */
 
